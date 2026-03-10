@@ -1,0 +1,7 @@
+# EDA and data loading
+datasets>=2.14.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+jupyter>=1.0.0
+notebook>=7.0.0
