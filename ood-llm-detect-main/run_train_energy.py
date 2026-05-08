@@ -51,7 +51,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no_pretrain", action="store_true", help="Skip weight download and train from scratch")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=256, help="Max token length; lower = less VRAM")
     args = parser.parse_args()

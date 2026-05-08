@@ -24,7 +24,7 @@ import torch.optim as optim
 import yaml
 from utils.Turing_utils import load_Turing
 from utils.OUTFOX_utils import load_OUTFOX
-from utils.M4_utils import load_M4
+from utils.M4_utils import load_M4, load_M4_with_gemini
 from utils.Deepfake_utils import load_deepfake
 from utils.raid_utils import load_raid
 from lightning.fabric.strategies import DDPStrategy
@@ -49,6 +49,65 @@ def collate_fn(batch):
     return encoded_batch,label,write_model,write_model_set
 
 
+def run_eval(model, val_dl, fabric, epoch, total_epoch, writer, tag_suffix=''):
+    """Run one validation pass; log metrics to TB with optional tag suffix.
+
+    Returns a metrics dict on rank 0, None on non-rank-0.
+    """
+    model.eval()
+    test_labels, energy_list = [], []
+    with torch.no_grad():
+        pbar = enumerate(val_dl)
+        if fabric.global_rank == 0:
+            pbar = tqdm(pbar, total=len(val_dl))
+            print(('\n' + '%11s' * 2) % ('Epoch', 'GPU_mem'))
+        for i, batch in pbar:
+            encoded_batch, label, write_model, write_model_set = batch
+            encoded_batch = {k: v.cuda() for k, v in encoded_batch.items()}
+            loss, neg_energy, k_out, k_outlabel = model(encoded_batch, write_model, write_model_set, label)
+            mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'
+            if fabric.global_rank == 0:
+                energy_list.append(neg_energy.cpu().detach())
+                test_labels.append(k_outlabel.cpu().detach())
+                pbar.set_description(('%11s' * 2) % (f'{epoch + 1}/{total_epoch}', mem))
+
+    if fabric.global_rank != 0:
+        return None
+
+    energy_np = torch.cat(energy_list).view(-1)
+    label_np = torch.cat(test_labels).view(-1)
+    fpr, tpr, _ = roc_curve(label_np, energy_np)
+    roc_auc = auc(fpr, tpr)
+    precision_, recall_, _ = precision_recall_curve(label_np, energy_np)
+    pr_auc = auc(recall_, precision_)
+    tpr_at_fpr_5 = np.interp(0.05, fpr, tpr)
+    fpr_at_tpr_95 = np.interp(0.95, tpr, fpr)
+    threshold, f1 = best_threshold_by_f1(label_np, energy_np)
+    y_pred = np.where(energy_np > threshold, 1, 0)
+    acc = accuracy_score(label_np, y_pred)
+    precision = precision_score(label_np, y_pred)
+    recall = recall_score(label_np, y_pred)
+    f1 = f1_score(label_np, y_pred)
+    label_hint = f'[{tag_suffix}]' if tag_suffix else ''
+    print(f"Val{label_hint}, AUC: {roc_auc}, pr_auc: {pr_auc}, tpr_at_fpr_5: {tpr_at_fpr_5}, "
+          f"fpr_at_tpr_95: {fpr_at_tpr_95}, Acc:{acc}, Precision:{precision}, "
+          f"Recall:{recall}, F1:{f1}")
+    s = ('_' + tag_suffix) if tag_suffix else ''
+    writer.add_scalar(f'val_auc{s}', roc_auc, epoch)
+    writer.add_scalar(f'val_acc{s}', acc, epoch)
+    writer.add_scalar(f'val_precision{s}', precision, epoch)
+    writer.add_scalar(f'val_recall{s}', recall, epoch)
+    writer.add_scalar(f'val_f1{s}', f1, epoch)
+    writer.add_scalar(f'val_threshold{s}', threshold, epoch)
+    writer.add_scalar(f'Val_AUC{s}', roc_auc, epoch)
+    return {
+        'auc': float(roc_auc), 'pr_auc': float(pr_auc),
+        'tpr_at_fpr_5': float(tpr_at_fpr_5), 'fpr_at_tpr_95': float(fpr_at_tpr_95),
+        'acc': float(acc), 'precision': float(precision),
+        'recall': float(recall), 'f1': float(f1), 'threshold': float(threshold),
+    }
+
+
 def train(opt):
     # Initialize fabric and set up data loaders
     torch.set_float32_matmul_precision("medium")
@@ -61,6 +120,7 @@ def train(opt):
     
 
     # load dataset and dataloader
+    val_dataloder_full = None
     if opt.dataset=='deepfake':
         dataset = load_deepfake(opt.path)
         passages_dataset = PassagesDataset(dataset[opt.database_name],mode='deepfake', model_set_idx=None)
@@ -70,14 +130,23 @@ def train(opt):
         val_dataloder = DataLoader(val_dataset, batch_size=opt.per_gpu_eval_batch_size,\
                                 num_workers=opt.num_workers, pin_memory=True,shuffle=True,drop_last=True,collate_fn=collate_fn)
     elif opt.dataset=='M4':
-        dataset = load_M4(opt.path)
+        if opt.n_gemini_train > 0:
+            dataset = load_M4_with_gemini(opt.path, opt.gemini_train_path, opt.n_gemini_train)
+        else:
+            dataset = load_M4(opt.path)
         passages_dataset = PassagesDataset(dataset[opt.database_name]+dataset[opt.database_name.replace('train','dev')],mode='M4')
         val_dataset = PassagesDataset(dataset[opt.test_dataset_name], mode='M4', model_set_idx=None)
 
         passages_dataloder = DataLoader(passages_dataset, batch_size=opt.per_gpu_batch_size,\
                                         num_workers=opt.num_workers, pin_memory=True,shuffle=True,drop_last=True,collate_fn=collate_fn)
         val_dataloder = DataLoader(val_dataset, batch_size=opt.per_gpu_eval_batch_size,\
-                                num_workers=opt.num_workers, pin_memory=True,shuffle=True,drop_last=True,collate_fn=collate_fn)   
+                                num_workers=opt.num_workers, pin_memory=True,shuffle=True,drop_last=True,collate_fn=collate_fn)
+
+        if opt.eval_full_test_path:
+            full_dataset = load_M4(opt.eval_full_test_path)
+            val_full_dataset = PassagesDataset(full_dataset[opt.test_dataset_name], mode='M4', model_set_idx=None)
+            val_dataloder_full = DataLoader(val_full_dataset, batch_size=opt.per_gpu_eval_batch_size,\
+                                    num_workers=opt.num_workers, pin_memory=True,shuffle=True,drop_last=True,collate_fn=collate_fn)
     elif opt.dataset=='raid':
         dataset = load_raid()
         passages_dataset = PassagesDataset(dataset[opt.database_name],mode='raid', model_set_idx=None)
@@ -110,6 +179,8 @@ def train(opt):
 
     passages_dataloder= fabric.setup_dataloaders(passages_dataloder)
     val_dataloder = fabric.setup_dataloaders(val_dataloder)
+    if val_dataloder_full is not None:
+        val_dataloder_full = fabric.setup_dataloaders(val_dataloder_full)
 
     # Set up tensorboard writer and save directory
     if (not opt.skip_train) and fabric.global_rank == 0 :
@@ -189,89 +260,40 @@ def train(opt):
                     writer.add_scalar('loss_classfiy', loss_classifiy.item(), current_step)
                     writer.add_scalar('loss_energy', loss_energy.item(), current_step)
         
-        #Validation
-        with torch.no_grad():
-            model.eval()
-            pbar = enumerate(val_dataloder)
-            if fabric.global_rank == 0:
-                pbar = tqdm(pbar, total = len(val_dataloder))
-                print(('\n' + '%11s' *(2)) % ('Epoch', 'GPU_mem'))
-                test_labels, energy_list = [], []
-
-            for i, batch in pbar:
-                encoded_batch, label, write_model, write_model_set = batch
-                encoded_batch = { k: v.cuda() for k, v in encoded_batch.items()}
-                loss, neg_energy, k_out, k_outlabel = model(encoded_batch, write_model, write_model_set,label)
-                
-                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'
-                if fabric.global_rank == 0:
-                    energy_list.append(neg_energy.cpu().detach())
-                    test_labels.append(k_outlabel.cpu().detach())
-                    pbar.set_description(
-                            ('%11s' * 2 ) % 
-                            (f'{epoch + 1}/{opt.total_epoch}', mem ))
-
-            # use roc_auc_score and other metrics to evaluate the performance 
-            if fabric.global_rank == 0:
-                energy_np = torch.cat(energy_list).view(-1)
-                label_np = torch.cat(test_labels).view(-1)
-
-                # auc = roc_auc_score(label_np, energy_np)
-                fpr, tpr, _ = roc_curve(label_np, energy_np)
-                roc_auc = auc(fpr, tpr)
-
-                precision_, recall_, _ = precision_recall_curve(label_np, energy_np)
-                pr_auc = auc(recall_, precision_)
-
-                target_fpr = 0.05
-                tpr_at_fpr_5 = np.interp(target_fpr, fpr, tpr)
-                target_tpr = 0.95                               # the TPR you care about
-                fpr_at_tpr_95 = np.interp(target_tpr, tpr, fpr)
-                # other metrics
-                threshold, f1 = best_threshold_by_f1(label_np, energy_np)
-                y_pred = np.where(energy_np>threshold,1,0)
-                acc = accuracy_score(label_np, y_pred)
-                precision = precision_score(label_np, y_pred)
-                recall = recall_score(label_np, y_pred)
-                f1 = f1_score(label_np, y_pred)
-                print(f"Val, AUC: {roc_auc}, pr_auc: {pr_auc}, tpr_at_fpr_5: {tpr_at_fpr_5}, fpr_at_tpr_95: {fpr_at_tpr_95}, Acc:{acc}, Precision:{precision}, Recall:{recall}, F1:{f1}")
-                writer.add_scalar('val_auc', roc_auc, epoch)
-                writer.add_scalar('val_acc', acc, epoch)
-                writer.add_scalar('val_precision', precision, epoch)
-                writer.add_scalar('val_recall', recall, epoch)
-                writer.add_scalar('val_f1', f1, epoch)
-                writer.add_scalar('val_threshold', threshold, epoch)
-                writer.add_scalar('val_f1', f1, epoch)
-                writer.add_scalar('Val_AUC', roc_auc, epoch)
+        # Validation: canonical (original) test set + optional gemini-augmented test set
+        metrics = run_eval(model, val_dataloder, fabric, epoch, opt.total_epoch, writer, tag_suffix='')
+        metrics_full = None
+        if val_dataloder_full is not None:
+            metrics_full = run_eval(model, val_dataloder_full, fabric, epoch, opt.total_epoch, writer, tag_suffix='full')
         torch.cuda.empty_cache()
         fabric.barrier()
-        # save model
-        if fabric.global_rank == 0:
-            # save the best model
-            if roc_auc > max_auc:
-                max_auc = roc_auc
+        # save model (best decision uses the canonical eval AUC)
+        if fabric.global_rank == 0 and metrics is not None:
+            if metrics['auc'] > max_auc:
+                max_auc = metrics['auc']
                 print("[Epoch %d/%d]  [loss: %0.2f] [MaxAUC: %0.4f]" % (epoch + 1, opt.total_epoch, loss, max_auc))
                 torch.save(model.state_dict(), os.path.join(opt.savedir, f"model_classifier_energy_best.pth"))
-                print("Model saved at: ", os.path.join(opt.savedir, f"model_classifier_energy_best.pth")) 
-                # save the best test result
+                print("Model saved at: ", os.path.join(opt.savedir, f"model_classifier_energy_best.pth"))
                 test_results = {
                     'epoch': epoch,
-                    'auc': roc_auc,
-                    'pr_auc': pr_auc, 
-                    'tpr_at_fpr_5': tpr_at_fpr_5,
-                    'fpr_at_tpr_95': fpr_at_tpr_95,
-                    'acc': acc,
-                    'precision': precision,
-                    'recall': recall,
-                    'f1': f1,
+                    'auc': metrics['auc'],
+                    'pr_auc': metrics['pr_auc'],
+                    'tpr_at_fpr_5': metrics['tpr_at_fpr_5'],
+                    'fpr_at_tpr_95': metrics['fpr_at_tpr_95'],
+                    'acc': metrics['acc'],
+                    'precision': metrics['precision'],
+                    'recall': metrics['recall'],
+                    'f1': metrics['f1'],
                 }
+                if metrics_full is not None:
+                    test_results['full'] = metrics_full
                 test_results_path = os.path.join(opt.savedir, f"test_results_{opt.dataset}_{opt.method}.json")
                 with open(test_results_path, 'w') as f:
                     json.dump(test_results, f)
                 print("Test results saved at: ", test_results_path)
 
             torch.save(model.state_dict(), os.path.join(opt.savedir, f"model_classifier_energy_last.pth"))
-            print("Model saved at: ", os.path.join(opt.savedir, f"model_classifier_energy_last.pth")) 
+            print("Model saved at: ", os.path.join(opt.savedir, f"model_classifier_energy_last.pth"))
             
 
 if __name__ == "__main__":
@@ -295,6 +317,14 @@ if __name__ == "__main__":
     parser.add_argument('--database_name', type=str, default='train', help="train,valid,test,test_ood")
     parser.add_argument('--valid_dataset_name', type=str, default='valid', help="train,valid,test,test_ood")
     parser.add_argument('--test_dataset_name', type=str, default='test', help="train,valid,test,test_ood")
+    parser.add_argument('--n_gemini_train', type=int, default=0,
+                        help="Number of gemini-only samples to mix into the M4 training set (0 = vanilla M4).")
+    parser.add_argument('--gemini_train_path', type=str,
+                        default='data/gemini-M4/_intermediate/gemini_train.jsonl',
+                        help="Path to a jsonl of gemini-only training samples (used when --n_gemini_train > 0).")
+    parser.add_argument('--eval_full_test_path', type=str, default='',
+                        help="Optional folder with a gemini-augmented test set in standard M4 layout. "
+                             "If set, runs a second eval pass each epoch and logs metrics with '_full' suffix.")
     parser.add_argument('--topk', type=int, default=10, help="Search topk nearest neighbors for validation")
 
     parser.add_argument('--a', type=float, default=1)

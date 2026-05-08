@@ -7,3 +7,6 @@ __pycache__/
 # Local experiment outputs and archives (regenerate with scripts)
 runs/
 *.zip
+data/*
+gemini-key.txt
+ood-llm-detect-main/data/gemini-M4/_intermediate/
